@@ -1,12 +1,13 @@
 import cv2
 import numpy as np
 import os
+import time
 
 ROI_FILE = "roi_v4.npy"
 
 # ---- FIXED SIZE ----
-TARGET_WIDTH = 960
-TARGET_HEIGHT = 540
+TARGET_WIDTH = 480
+TARGET_HEIGHT = 270
 
 clicked_points = []
 clone_img = None
@@ -97,7 +98,7 @@ def pipeline(frame, roi_norm):
         blurred, 255, 
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
         cv2.THRESH_BINARY_INV, 
-        31, 15
+        15, 7
     )
 
     # --- 2. Apply Wide ROI Mask ---
@@ -129,7 +130,7 @@ def pipeline(frame, roi_norm):
     warped = cv2.warpPerspective(masked_binary, matrix, (width, height))
 
     # --- 4. Morphological Close (Combine components focusing on vertical lines) ---
-    kernel = np.ones((25, 5), np.uint8) 
+    kernel = np.ones((13, 3), np.uint8) 
     closed = cv2.morphologyEx(warped, cv2.MORPH_CLOSE, kernel)
 
     contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -147,22 +148,31 @@ def pipeline(frame, roi_norm):
         aspect_ratio = float(h) / w if w > 0 else 0
 
         # Filter: Area size, relative height, and Aspect Ratio (Shape Constraint)
-        if area > 100 and h > height * 0.15 and aspect_ratio > 1.2:
+        if area > 25 and h > height * 0.15 and aspect_ratio > 1.2:
             mask_c = np.zeros_like(warped)
             cv2.drawContours(mask_c, [cnt], -1, 255, -1)
 
             ys, xs = np.nonzero(mask_c)
 
-            if len(xs) > 50:
+            if len(xs) > 25:
                 fit = np.polyfit(ys, xs, 2)
                 
-                # Calculate where this line hits the bottom of the image
-                x_int = fit[0]*height**2 + fit[1]*height + fit[2]
+                # Evaluate the x position at the bottom-most visible point of this line
+                # This represents where the lane is closest to the car.
+                bottom_y = np.max(ys)
+                x_bottom = fit[0]*(bottom_y**2) + fit[1]*bottom_y + fit[2]
 
-                if np.mean(xs) < width / 2:
-                    left_fits.append((fit, x_int, ys))
+                # --- Area Limit ---
+                # Ignore lines that are too far out on the extreme left or right edges
+                if x_bottom < width * 0.10 or x_bottom > width * 0.90:
+                    continue
+
+                # Classify based on position near the car, not average position,
+                # because sharp curves can cross the screen's center line.
+                if x_bottom < width / 2:
+                    left_fits.append((fit, x_bottom, ys))
                 else:
-                    right_fits.append((fit, x_int, ys))
+                    right_fits.append((fit, x_bottom, ys))
 
 
     # --- 6. Steering Calculation & Lane Rebuild ---
@@ -172,7 +182,7 @@ def pipeline(frame, roi_norm):
     # Dismiss wrong lanes by finding the one closest to expected positions
     left_fit = None
     if len(left_fits) > 0:
-        # For left lanes, choose the one with the largest x_int (closest to the center line)
+        # For left lanes, choose the one with the largest x_bottom (closest to the center line)
         left_fits.sort(key=lambda item: item[1], reverse=True)
         left_fit, _, ys_left = left_fits[0]
         
@@ -183,7 +193,7 @@ def pipeline(frame, roi_norm):
 
     right_fit = None
     if len(right_fits) > 0:
-        # For right lanes, choose the one with the smallest x_int (closest to the center line)
+        # For right lanes, choose the one with the smallest x_bottom (closest to the center line)
         right_fits.sort(key=lambda item: item[1], reverse=False)
         right_fit, _, ys_right = right_fits[0]
         
@@ -270,15 +280,24 @@ def process_video(video_path, force_reselect=False):
     roi_norm = select_and_save_roi(first_frame_resized) if force_reselect else load_roi(first_frame_resized)
     if roi_norm is None: return
 
+    prev_time = time.time()
+    fps_avg = 0.0
+
     while True:
         ret, frame = cap.read()
         if not ret: break # End of video
 
+        current_time = time.time()
+        fps = 1.0 / (current_time - prev_time + 1e-5)
+        prev_time = current_time
+        fps_avg = (fps_avg * 0.9) + (fps * 0.1) if fps_avg > 0 else fps
+
         result, binary_view, steer_deg, rebuild_mode = pipeline(frame, roi_norm)
 
         # Display Overlay Data
-        cv2.putText(result, f"Steering: {steer_deg:.2f} deg", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
-        cv2.putText(result, f"Mode: {rebuild_mode}", (30, 90), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 3)
+        cv2.putText(result, f"Steering: {steer_deg:.2f} deg", (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        cv2.putText(result, f"Mode: {rebuild_mode}", (15, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        cv2.putText(result, f"FPS: {int(fps_avg)}", (15, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 100, 100), 2)
 
         cv2.imshow("Final Output", result)
         cv2.imshow("Bird's Eye Mask", binary_view)
