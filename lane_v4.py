@@ -10,6 +10,7 @@ TARGET_HEIGHT = 540
 
 clicked_points = []
 clone_img = None
+smoothed_center_fit = None
 
 def resize_image(img):
     return cv2.resize(img, (TARGET_WIDTH, TARGET_HEIGHT))
@@ -77,6 +78,7 @@ def load_roi(img):
 
 # ---------- MAIN PIPELINE ----------
 def pipeline(frame, roi_norm):
+    global smoothed_center_fit
     img = resize_image(frame)
     height, width = img.shape[:2]
 
@@ -98,9 +100,19 @@ def pipeline(frame, roi_norm):
         31, 15
     )
 
-    # --- 2. Apply ROI Mask ---
+    # --- 2. Apply Wide ROI Mask ---
+    # We still use the clicked points for perspective transform, but we widen 
+    # the search area to cover the full width of the screen below the horizon.
+    # This prevents curved lanes from being cut off when the car turns.
+    horizon_y = int(min(src_points[0][1], src_points[1][1]))
     mask = np.zeros_like(binary_mask)
-    cv2.fillPoly(mask, np.int32([src_points]), 255)
+    wide_roi = np.int32([[
+        [0, horizon_y],
+        [width, horizon_y],
+        [width, height],
+        [0, height]
+    ]])
+    cv2.fillPoly(mask, wide_roi, 255)
     masked_binary = cv2.bitwise_and(binary_mask, mask)
 
     # --- 3. Perspective Transform ---
@@ -143,41 +155,105 @@ def pipeline(frame, roi_norm):
 
             if len(xs) > 50:
                 fit = np.polyfit(ys, xs, 2)
+                
+                # Calculate where this line hits the bottom of the image
+                x_int = fit[0]*height**2 + fit[1]*height + fit[2]
 
                 if np.mean(xs) < width / 2:
-                    left_fits.append(fit)
-                    color = (255, 0, 0)
+                    left_fits.append((fit, x_int, ys))
                 else:
-                    right_fits.append(fit)
-                    color = (0, 0, 255)
+                    right_fits.append((fit, x_int, ys))
 
-                ploty = np.linspace(np.min(ys), np.max(ys), 100)
-                fitx = fit[0]*ploty**2 + fit[1]*ploty + fit[2]
 
-                pts = np.array([np.transpose(np.vstack([fitx, ploty]))])
-                cv2.polylines(color_warp, np.int32([pts]), False, color, 20)
-
-    # --- 6. Steering Calculation ---
+    # --- 6. Steering Calculation & Lane Rebuild ---
     steer_deg = 0.0
-    if len(left_fits) > 0 and len(right_fits) > 0:
-        center_fit = (np.mean(left_fits, axis=0) + np.mean(right_fits, axis=0)) / 2
+    rebuild_mode = "No Lanes"
 
+    # Dismiss wrong lanes by finding the one closest to expected positions
+    left_fit = None
+    if len(left_fits) > 0:
+        # For left lanes, choose the one with the largest x_int (closest to the center line)
+        left_fits.sort(key=lambda item: item[1], reverse=True)
+        left_fit, _, ys_left = left_fits[0]
+        
+        ploty = np.linspace(np.min(ys_left), np.max(ys_left), 100)
+        fitx = left_fit[0]*ploty**2 + left_fit[1]*ploty + left_fit[2]
+        pts = np.array([np.transpose(np.vstack([fitx, ploty]))])
+        cv2.polylines(color_warp, np.int32([pts]), False, (255, 0, 0), 20)
+
+    right_fit = None
+    if len(right_fits) > 0:
+        # For right lanes, choose the one with the smallest x_int (closest to the center line)
+        right_fits.sort(key=lambda item: item[1], reverse=False)
+        right_fit, _, ys_right = right_fits[0]
+        
+        ploty = np.linspace(np.min(ys_right), np.max(ys_right), 100)
+        fitx = right_fit[0]*ploty**2 + right_fit[1]*ploty + right_fit[2]
+        pts = np.array([np.transpose(np.vstack([fitx, ploty]))])
+        cv2.polylines(color_warp, np.int32([pts]), False, (0, 0, 255), 20)
+
+    center_fit = None
+
+    if left_fit is not None and right_fit is not None:
+        # 2 Lane Rebuild
+        center_fit = (left_fit + right_fit) / 2
+        rebuild_mode = "2 Lanes Rebuild"
+    elif left_fit is not None:
+        # 1 Lane Rebuild (Left only) -> Shift right by half lane width
+        center_fit = left_fit.copy()
+        center_fit[2] += width * 0.25
+        rebuild_mode = "1 Lane Rebuild (Left)"
+    elif right_fit is not None:
+        # 1 Lane Rebuild (Right only) -> Shift left by half lane width
+        center_fit = right_fit.copy()
+        center_fit[2] -= width * 0.25
+        rebuild_mode = "1 Lane Rebuild (Right)"
+
+    # --- 7. Temporal Smoothing Filter ---
+    if center_fit is not None:
+        if smoothed_center_fit is None:
+            smoothed_center_fit = center_fit
+        else:
+            alpha = 0.2 # 20% current frame, 80% history. Adjust closer to 1.0 for less smoothing.
+            smoothed_center_fit = alpha * center_fit + (1 - alpha) * smoothed_center_fit
+    elif smoothed_center_fit is not None:
+        rebuild_mode = "History Fallback"
+
+    if smoothed_center_fit is not None:
         ploty = np.linspace(0, height-1, height)
-        center_x = center_fit[0]*ploty**2 + center_fit[1]*ploty + center_fit[2]
+        center_x = smoothed_center_fit[0]*ploty**2 + smoothed_center_fit[1]*ploty + smoothed_center_fit[2]
 
         pts_center = np.array([np.transpose(np.vstack([center_x, ploty]))])
         cv2.polylines(color_warp, np.int32([pts_center]), False, (0, 255, 0), 100)
 
-        y_eval = height
-        slope = 2 * center_fit[0] * y_eval + center_fit[1]
-        steer_deg = np.degrees(np.arctan(slope))
+        # --- Improved Steering Controller (PD Controller) ---
+        # Lookahead point for steering control (e.g., 70% down the bird's eye view)
+        lookahead_y = height * 0.7
+        target_x = smoothed_center_fit[0]*(lookahead_y**2) + smoothed_center_fit[1]*lookahead_y + smoothed_center_fit[2]
+
+        # 1. Cross-Track Error (CTE): Lateral distance from car center to lane center
+        car_center_x = width / 2.0
+        cte = target_x - car_center_x
+
+        # 2. Heading Error: Angle of the lane at the lookahead point
+        slope = 2 * smoothed_center_fit[0] * lookahead_y + smoothed_center_fit[1]
+        heading_error_deg = np.degrees(np.arctan(slope))
+
+        # 3. PD Controller logic (You can tune Kp and Kd to make steering sharper/smoother)
+        Kp = 0.15  # Proportional gain for lateral offset (CTE)
+        Kd = 0.40  # Derivative/Heading gain for lane angle
+
+        steer_deg = (Kp * cte) + (Kd * heading_error_deg)
         steer_deg = np.clip(steer_deg, -30, 30)
+
+        # Draw a target dot to visualize what the car is aiming for
+        cv2.circle(color_warp, (int(target_x), int(lookahead_y)), 15, (0, 165, 255), -1)
 
     # Overlay
     newwarp = cv2.warpPerspective(color_warp, Minv, (width, height))
     result = cv2.addWeighted(img, 1, newwarp, 0.8, 0)
 
-    return result, closed, steer_deg
+    return result, closed, steer_deg, rebuild_mode
 
 # ---------- VIDEO PROCESSOR ----------
 def process_video(video_path, force_reselect=False):
@@ -198,10 +274,11 @@ def process_video(video_path, force_reselect=False):
         ret, frame = cap.read()
         if not ret: break # End of video
 
-        result, binary_view, steer_deg = pipeline(frame, roi_norm)
+        result, binary_view, steer_deg, rebuild_mode = pipeline(frame, roi_norm)
 
         # Display Overlay Data
         cv2.putText(result, f"Steering: {steer_deg:.2f} deg", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
+        cv2.putText(result, f"Mode: {rebuild_mode}", (30, 90), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 3)
 
         cv2.imshow("Final Output", result)
         cv2.imshow("Bird's Eye Mask", binary_view)
