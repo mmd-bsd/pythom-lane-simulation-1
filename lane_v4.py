@@ -88,33 +88,25 @@ def pipeline(frame, roi_norm):
     src_points[:, 0] *= width
     src_points[:, 1] *= height
 
-    # --- 1. Dynamic Black Color Filter ---
+    horizon_y = int(min(src_points[0][1], src_points[1][1]))
+
+    # --- 1. Dynamic Black Color Filter (Optimized) ---
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
     
-    # Adaptive Threshold handles changing lighting and shadows naturally.
-    # THRESH_BINARY_INV isolates dark lanes by turning dark regions white.
-    binary_mask = cv2.adaptiveThreshold(
-        blurred, 255, 
+    # OPTIMIZATION: Only process the road area below the horizon. 
+    # This skips the sky and cuts the heavy Adaptive Threshold workload by ~50%.
+    gray_road = gray[horizon_y:height, :]
+    blurred_road = cv2.GaussianBlur(gray_road, (5, 5), 0)
+    binary_road = cv2.adaptiveThreshold(
+        blurred_road, 255, 
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
         cv2.THRESH_BINARY_INV, 
         15, 7
     )
 
-    # --- 2. Apply Wide ROI Mask ---
-    # We still use the clicked points for perspective transform, but we widen 
-    # the search area to cover the full width of the screen below the horizon.
-    # This prevents curved lanes from being cut off when the car turns.
-    horizon_y = int(min(src_points[0][1], src_points[1][1]))
-    mask = np.zeros_like(binary_mask)
-    wide_roi = np.int32([[
-        [0, horizon_y],
-        [width, horizon_y],
-        [width, height],
-        [0, height]
-    ]])
-    cv2.fillPoly(mask, wide_roi, 255)
-    masked_binary = cv2.bitwise_and(binary_mask, mask)
+    # --- 2. Apply Wide ROI Mask (Optimized) ---
+    masked_binary = np.zeros_like(gray)
+    masked_binary[horizon_y:height, :] = binary_road
 
     # --- 3. Perspective Transform ---
     dst_points = np.float32([
@@ -139,6 +131,9 @@ def pipeline(frame, roi_norm):
     left_fits = []
     right_fits = []
 
+    # OPTIMIZATION: Allocate mask once outside the loop instead of every contour
+    mask_c = np.zeros_like(warped)
+
     # --- 5. Shape Filtering ---
     for cnt in contours:
         x, y, w, h = cv2.boundingRect(cnt)
@@ -149,10 +144,12 @@ def pipeline(frame, roi_norm):
 
         # Filter: Area size, relative height, and Aspect Ratio (Shape Constraint)
         if area > 25 and h > height * 0.15 and aspect_ratio > 1.2:
-            mask_c = np.zeros_like(warped)
+            mask_c.fill(0)
             cv2.drawContours(mask_c, [cnt], -1, 255, -1)
 
-            ys, xs = np.nonzero(mask_c)
+            # OPTIMIZATION: Only scan the small bounding box for pixels, not the whole screen!
+            ys_local, xs_local = np.nonzero(mask_c[y:y+h, x:x+w])
+            ys, xs = ys_local + y, xs_local + x
 
             if len(xs) > 25:
                 fit = np.polyfit(ys, xs, 2)
@@ -302,7 +299,8 @@ def process_video(video_path, force_reselect=False):
         cv2.imshow("Final Output", result)
         cv2.imshow("Bird's Eye Mask", binary_view)
 
-        if cv2.waitKey(25) & 0xFF == 27: # Press Esc to exit
+        # OPTIMIZATION: Changed waitKey from 25ms to 1ms to uncap the frame rate
+        if cv2.waitKey(1) & 0xFF == 27: # Press Esc to exit
             break
 
     cap.release()
