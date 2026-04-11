@@ -93,21 +93,15 @@ def pipeline(frame, roi_norm):
 
     horizon_y = int(min(src_points[0][1], src_points[1][1]))
 
-    # --- 1. Dynamic Black Color Filter (Enhanced V6) ---
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # --- 1. Dynamic Black Color Filter (Optimized for Speed) ---
+    # OPTIMIZATION: Crop the image BEFORE doing any color conversions! 
+    # This cuts the heavy processing workload by more than 50% right away.
+    img_road = img[horizon_y:height, :]
+    gray_road = cv2.cvtColor(img_road, cv2.COLOR_BGR2GRAY)
     
-    # Contrast Limited Adaptive Histogram Equalization (CLAHE)
-    # This heavily boosts the contrast of lane lines against the road.
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    gray_clahe = clahe.apply(gray)
-    
-    # OPTIMIZATION: Only process the road area below the horizon.
-    gray_road = gray_clahe[horizon_y:height, :]
-    
-    # Bilateral Filter replaces Gaussian Blur
-    # It preserves sharp edges (lanes) while aggressively blurring flat textures (road asphalt noise)
-    blurred_road = cv2.bilateralFilter(gray_road, d=9, sigmaColor=75, sigmaSpace=75)
-    
+    # Swapped heavy Bilateral Filter & CLAHE back to the blazing-fast Gaussian Blur
+    blurred_road = cv2.GaussianBlur(gray_road, (5, 5), 0)
+
     binary_road = cv2.adaptiveThreshold(
         blurred_road, 255, 
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
@@ -115,25 +109,20 @@ def pipeline(frame, roi_norm):
         15, 7
     )
     
-    # Median Blur wipes out tiny "salt and pepper" white noise dots
-    binary_road = cv2.medianBlur(binary_road, 3)
-
     # --- EXPLICIT STRICT BLACK COLOR FILTER ---
-    # Adaptive threshold finds anything "darker than its surroundings" (which accidentally includes shadows).
-    # We combine it with an HSV filter to strictly isolate pixels that are truly BLACK.
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    hsv_road = hsv[horizon_y:height, :]
+    # Convert ONLY the road portion to HSV, completely skipping the sky
+    hsv_road = cv2.cvtColor(img_road, cv2.COLOR_BGR2HSV)
     
     lower_black = np.array([0, 0, 0])
     # Very relaxed: Allows much lighter grays, faded lines, and shadows to pass
-    upper_black = np.array([180, 255, 140]) 
+    upper_black = np.array([180, 255, 110]) 
     black_mask = cv2.inRange(hsv_road, lower_black, upper_black)
     
     # Combine both: Must have a crisp edge (adaptive) AND be actually black (HSV)
     combined_binary = cv2.bitwise_and(binary_road, black_mask)
 
     # --- 2. Apply Wide ROI Mask (Optimized) ---
-    masked_binary = np.zeros_like(gray)
+    masked_binary = np.zeros((height, width), dtype=np.uint8)
     masked_binary[horizon_y:height, :] = combined_binary
 
     # --- 3. Perspective Transform ---
