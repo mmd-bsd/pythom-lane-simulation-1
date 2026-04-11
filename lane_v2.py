@@ -61,7 +61,7 @@ def process_lane_image(image_path):
     height, width = img.shape[:2]
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    _, binary_mask = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
+    _, binary_mask = cv2.threshold(gray, 130, 255, cv2.THRESH_BINARY_INV)
 
     mask = np.zeros_like(binary_mask)
     cv2.fillPoly(mask, np.int32([src_points]), 255)
@@ -175,4 +175,4 @@ def process_lane_image(image_path):
 
     plt.show()
 
-process_lane_image('2.png')
+process_lane_image('6.png')
