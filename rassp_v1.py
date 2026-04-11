@@ -3,7 +3,7 @@ import numpy as np
 import os
 import time
 
-ROI_FILE = "roi_v6.npy"
+ROI_FILE = "roi_rassp.npy"
 
 # ---- FIXED SIZE ----
 TARGET_WIDTH = 480
@@ -126,7 +126,7 @@ def pipeline(frame, roi_norm):
     
     lower_black = np.array([0, 0, 0])
     # Very relaxed: Allows much lighter grays, faded lines, and shadows to pass
-    upper_black = np.array([180, 255, 110]) 
+    upper_black = np.array([180, 255, 140]) 
     black_mask = cv2.inRange(hsv_road, lower_black, upper_black)
     
     # Combine both: Must have a crisp edge (adaptive) AND be actually black (HSV)
@@ -272,7 +272,7 @@ def pipeline(frame, roi_norm):
     newwarp = cv2.warpPerspective(color_warp, Minv, (width, height))
     result = cv2.addWeighted(img, 1, newwarp, 0.8, 0)
 
-    return result, closed, steer_deg, rebuild_mode
+    return result, steer_deg, rebuild_mode
 
 # ---------- CAMERA PROCESSOR ----------
 def process_camera(camera_index=0, force_reselect=False):
@@ -313,15 +313,14 @@ def process_camera(camera_index=0, force_reselect=False):
         prev_time = current_time
         fps_avg = (fps_avg * 0.9) + (fps * 0.1) if fps_avg > 0 else fps
 
-        result, binary_view, steer_deg, rebuild_mode = pipeline(frame, roi_norm)
+        result, steer_deg, rebuild_mode = pipeline(frame, roi_norm)
 
         # Display Overlay Data
         cv2.putText(result, f"Steering: {steer_deg:.2f} deg", (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         cv2.putText(result, f"Mode: {rebuild_mode}", (15, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
         cv2.putText(result, f"FPS: {int(fps_avg)}", (15, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 100, 100), 2)
 
-        cv2.imshow("Final Output", result)
-        cv2.imshow("Bird's Eye Mask", binary_view)
+        cv2.imshow("Raspberry Pi - Lane Tracking", result)
 
         if cv2.waitKey(1) & 0xFF == 27: # Press Esc to exit
             break
@@ -332,4 +331,5 @@ def process_camera(camera_index=0, force_reselect=False):
 # -------- RUN EXAMPLES --------
 if __name__ == "__main__":
     # Process live video from the USB camera
+    # Depending on your Raspberry Pi, the index might be 0, 1, or 2
     process_camera(2)
